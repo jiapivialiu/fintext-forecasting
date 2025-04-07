@@ -1,144 +1,294 @@
 # Neural nets on embedded text with JAX
 from datasets import load_dataset
 
-bigdata_train = load_dataset("TheFinAI/flare-sm-bigdata", split="train")
+#* Data Loading *#
+
 acl_train = load_dataset("TheFinAI/flare-sm-acl", split="train")
-cikm_train = load_dataset("TheFinAI/flare-sm-cikm", split="train")
-
-bigdata_valid = load_dataset("TheFinAI/flare-sm-bigdata", split="validation")
 acl_valid = load_dataset("TheFinAI/flare-sm-acl", split="valid")
-cikm_valid = load_dataset("TheFinAI/flare-sm-cikm", split="valid")
-
-bigdata_test = load_dataset("TheFinAI/flare-sm-bigdata", split="test")
 acl_test = load_dataset("TheFinAI/flare-sm-acl", split="test")
-cikm_test = load_dataset("TheFinAI/flare-sm-cikm", split="test")
 
-bigdata_train_df = bigdata_train.to_pandas()[['gold', 'text']] # 0: rise, 1: fall
-acl_train_df = acl_train.to_pandas()[['gold', 'text']] 
-cikm_train_df = cikm_train.to_pandas()[['gold', 'text']]
+# * Data Preprocessing *#
 
-bigdata_valid_df = bigdata_valid.to_pandas()[['gold', 'text']]
+# Select columns
+acl_train_df = acl_train.to_pandas()[['gold', 'text']] # 0: rise, 1: fall
 acl_valid_df = acl_valid.to_pandas()[['gold', 'text']]
-cikm_valid_df = cikm_valid.to_pandas()[['gold', 'text']]
-
-bigdata_test_df = bigdata_test.to_pandas()[['gold', 'text']]
 acl_test_df = acl_test.to_pandas()[['gold', 'text']]
-cikm_test_df = cikm_test.to_pandas()[['gold', 'text']]
 
-# embedding model
+# Initialize the pre-trained model for text embedding (using a compact and efficient model)
 from sentence_transformers import SentenceTransformer
+import numpy as np
 
-# Initialize the model (using a compact and efficient model)
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
-# Function to get sentence embeddings
-def get_sbert_embeddings(texts):
-    embeddings = model.encode(texts, convert_to_numpy=True)
-    return embeddings
-
-# Combine embedded text features with non-text features
-import numpy as np
-texts = bigdata_train_df['text'].tolist()
-X_text_embeddings = get_sbert_embeddings(texts)
-X_text_embeddings = np.array(X_text_embeddings, dtype=np.float32)
-bigdata_train_embedded = np.concatenate([bigdata_train_df['gold'], X_text_embeddings], axis=1)
-
-# Convert the combined data to JAX arrays if needed
-import jax.numpy as jnp
-bigdata_train_embedded_jax = jnp.array(bigdata_train_embedded, dtype=jnp.float32)
-bigdata_train_embedded_jax.shape
+# Text embedding with batch processing
+def batch_encode(texts, batch_size=32):
+    def get_sbert_embeddings(texts):
+        embeddings = model.encode(texts, convert_to_numpy=True)
+        return embeddings
+    embeddings_list = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        batch_embeddings = get_sbert_embeddings(batch)
+        embeddings_list.append(batch_embeddings)
+    return np.vstack(embeddings_list)
 
 import jax
 import jax.numpy as jnp
-from jax import grad, jit, random
-import flax
-from flax import linen as nn
-from jax import random
 
-# initialize random parameters
-def init_params(layer_sizes, key):
-    """Initialize parameters for a simple MLP model."""
+# training data processing
+texts = acl_train_df['text'].tolist()
+X_train_embeddings = batch_encode(texts)
+X_train_embeddings = np.array(X_train_embeddings, dtype=np.float32)
+acl_train_embedded = np.concatenate([acl_train_df[['gold']], X_train_embeddings], axis=1)
+acl_train_embedded_jax = jnp.array(acl_train_embedded, dtype=jnp.float32)
+
+# validation data processing
+valid_texts = acl_valid_df['text'].tolist()
+X_valid_embeddings = batch_encode(valid_texts)
+X_valid_embeddings = np.array(X_valid_embeddings, dtype=np.float32)
+acl_valid_embedded = np.concatenate([acl_valid_df[['gold']], X_valid_embeddings], axis=1)
+acl_valid_embedded_jax = jnp.array(acl_valid_embedded, dtype=jnp.float32)
+
+# test data processing
+test_texts = acl_test_df['text'].tolist()
+X_test_embeddings = batch_encode(test_texts)
+X_test_embeddings = np.array(X_test_embeddings, dtype=np.float32)
+acl_test_embedded = np.concatenate([acl_test_df[['gold']], X_test_embeddings], axis=1)
+acl_test_embedded_jax = jnp.array(acl_test_embedded, dtype=jnp.float32)
+
+# * Modelling *#
+
+#* 1. Logistic Regression *#
+from sklearn.metrics import classification_report
+from sklearn.linear_model import LogisticRegression
+
+# Prepare data for modelling
+y_train = acl_train_embedded[:, 0].reshape(-1, 1)
+X_train = acl_train_embedded[:, 1:]
+y_valid = acl_valid_embedded[:, 0].reshape(-1, 1)
+X_valid = acl_valid_embedded[:, 1:]
+
+# Train logistic regression model
+maxiter = 1000
+lr_model = LogisticRegression(max_iter=maxiter, random_state=42)
+lr_model.fit(X_train, y_train)
+
+# Evaluate on validation set
+y_pred = lr_model.predict(X_valid)
+
+# Print performance metrics
+print("\nLogistic Regression Results:")
+print(f"Validation Accuracy: {lr_model.score(X_valid, y_valid):.4f}")
+print("\nDetailed Classification Report:")
+print(classification_report(y_valid, y_pred))
+
+#* 2. MLP with JAX *#
+import jax
+import jax.numpy as jnp
+from jax import random
+from typing import List, Tuple, Any
+import optax  # For Adam optimizer
+from functools import partial
+
+# Prepare data for modelling
+y_train = acl_train_embedded_jax[:, 0].reshape(-1, 1)
+X_train = acl_train_embedded_jax[:, 1:]
+y_valid = acl_valid_embedded_jax[:, 0].reshape(-1, 1)
+X_valid = acl_valid_embedded_jax[:, 1:]
+input_dim = X_train.shape[1]  # Get input dimension from training data
+
+# Define MLP in JAX
+def init_mlp_params(layer_sizes: List[int], key: Any) -> List[Tuple[jnp.ndarray, jnp.ndarray]]:
     params = []
-    for i in range(len(layer_sizes) - 1):
-        # Initialize weights with a small random value and biases as zeros
-        w_key, b_key = random.split(key)
-        w = random.normal(w_key, (layer_sizes[i], layer_sizes[i+1])) * jnp.sqrt(2.0 / layer_sizes[i])
-        b = jnp.zeros((layer_sizes[i+1],))
-        params.append((w, b))
+    keys = random.split(key, len(layer_sizes))
+    for in_dim, out_dim, k in zip(layer_sizes[:-1], layer_sizes[1:], keys):
+        w_key, b_key = random.split(k)
+        W = random.normal(w_key, (in_dim, out_dim)) * jnp.sqrt(2. / in_dim)
+        b = jnp.zeros((out_dim,))
+        params.append((W, b))
     return params
 
-# Define the neural nets with enhancements
-def leaky_relu(x, alpha=0.01):
-    """Leaky ReLU activation function."""
-    return jnp.where(x > 0, x, alpha * x)
+# Enhanced MLP with dropout
+def mlp_forward(params: List[Tuple[jnp.ndarray, jnp.ndarray]], x: jnp.ndarray, dropout_rate: float = 0.0, 
+               train: bool = False, key: Any = None) -> jnp.ndarray:
+    """Forward pass with dropout support"""
+    for i, (W, b) in enumerate(params[:-1]):
+        x = jnp.dot(x, W) + b
+        x = jax.nn.relu(x)
+        
+        # Apply dropout during training
+        if train and dropout_rate > 0:
+            if key is None:
+                raise ValueError("Random key required for dropout")
+            dropout_key = random.fold_in(key, i)  # Different key for each layer
+            mask = random.bernoulli(dropout_key, p=1-dropout_rate, shape=x.shape)
+            x = x * mask / (1 - dropout_rate)  # Scale to maintain expected value
+            
+    W_last, b_last = params[-1]
+    logits = jnp.dot(x, W_last) + b_last
+    return logits
 
-def mlp(params, X, dropout_key=None, dropout_rate=0.2):
-    """A feedforward MLP with dropout."""
-    for i, (w, b) in enumerate(params[:-1]):
-        X = jnp.dot(X, w) + b
-        X = leaky_relu(X)  # Use LeakyReLU activation
-        if dropout_key is not None:
-            # Apply dropout during training
-            dropout_key, subkey = random.split(dropout_key)
-            mask = random.bernoulli(subkey, p=1 - dropout_rate, shape=X.shape)
-            X = X * mask / (1 - dropout_rate)
-    w, b = params[-1]
-    return jnp.dot(X, w) + b  # Linear output layer
+# Loss and training step
+def binary_cross_entropy_loss(logits: jnp.ndarray, labels: jnp.ndarray) -> jnp.ndarray:
+    preds = jax.nn.sigmoid(logits)
+    return -jnp.mean(labels * jnp.log(preds + 1e-7) + (1 - labels) * jnp.log(1 - preds + 1e-7))
 
-# Update the loss function to binary cross-entropy
-def binary_cross_entropy_loss(params, X, y):
-    """Compute the binary cross-entropy loss."""
-    logits = mlp(params, X)
-    preds = jax.nn.sigmoid(logits)  # Apply sigmoid for binary classification
-    return -jnp.mean(y * jnp.log(preds + 1e-8) + (1 - y) * jnp.log(1 - preds + 1e-8))
+# Improved training step with Adam optimizer
+@partial(jax.jit, static_argnums=(4, 5))
+def train_step(params, X_batch, y_batch, opt_state, dropout_rate=0.2, train=True):
+    """Single training step with Adam optimizer and dropout"""
+    key = random.PRNGKey(0)  # For reproducibility
+    
+    def loss_fn(p):
+        logits = mlp_forward(p, X_batch, dropout_rate=dropout_rate, train=train, key=key)
+        return binary_cross_entropy_loss(logits, y_batch)
+    
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    updates, new_opt_state = optimizer.update(grads, opt_state)
+    new_params = optax.apply_updates(params, updates)
+    return new_params, new_opt_state, loss
 
-# Compute gradients for the updated loss function
-grad_loss_fn = grad(binary_cross_entropy_loss)
+# Hyperparameter tuning
+def tune_hyperparameters():
+    best_accuracy = 0.0
+    best_params = None
+    best_config = {}
+    
+    # Define hyperparameter search space
+    learning_rates = [1e-4, 5e-4, 1e-3]
+    hidden_layer_configs = [
+        [128, 64],
+        [256, 128],
+        [128, 64, 32]
+    ]
+    dropout_rates = [0.0, 0.2, 0.3, .4, .5, .6, .7, .8, .9]
+    batch_sizes = [32, 64, 128]  # For mini-batch training
+    
+    results = []
+    
+    for lr in learning_rates:
+        for hidden_layers in hidden_layer_configs:
+            for dropout_rate in dropout_rates:
+                for batch_size in batch_sizes:
+                    print(f"\nTrying: lr={lr}, layers={hidden_layers}, dropout={dropout_rate}, batch_size={batch_size}")
+                    
+                    # Initialize model
+                    key = random.PRNGKey(42)
+                    layer_sizes = [input_dim] + hidden_layers + [1]
+                    params = init_mlp_params(layer_sizes, key)
+                    
+                    # Initialize optimizer
+                    global optimizer  # Make it accessible in train_step
+                    optimizer = optax.adam(learning_rate=lr)
+                    opt_state = optimizer.init(params)
+                    
+                    # Mini-batch training
+                    num_batches = max(1, len(X_train) // batch_size)
+                    
+                    for epoch in range(50):  # Fewer epochs for tuning
+                        # Shuffle data
+                        perm = random.permutation(key, len(X_train))
+                        key = random.fold_in(key, epoch)  # Update key for next epoch
+                        
+                        # Mini-batch updates
+                        total_loss = 0.0
+                        for i in range(num_batches):
+                            batch_idx = perm[i * batch_size:(i + 1) * batch_size]
+                            X_batch = X_train[batch_idx]
+                            y_batch = y_train[batch_idx]
+                            
+                            params, opt_state, loss = train_step(
+                                params, X_batch, y_batch, opt_state, 
+                                dropout_rate=dropout_rate, train=True
+                            )
+                            total_loss += loss
+                        
+                        avg_loss = total_loss / num_batches
+                        if epoch % 10 == 0:
+                            print(f"Epoch {epoch+1} | Avg Loss: {avg_loss:.4f}")
+                    
+                    # Evaluate on validation set
+                    val_accuracy = evaluate(params, X_valid, y_valid, dropout_rate=0.0, train=False)
+                    print(f"Validation Accuracy: {val_accuracy:.4f}")
+                    
+                    # Record result
+                    config = {
+                        'learning_rate': lr,
+                        'hidden_layers': hidden_layers,
+                        'dropout_rate': dropout_rate,
+                        'batch_size': batch_size,
+                        'val_accuracy': val_accuracy
+                    }
+                    results.append(config)
+                    
+                    # Update best model
+                    if val_accuracy > best_accuracy:
+                        best_accuracy = val_accuracy
+                        best_params = params
+                        best_config = config
+    
+    print("\n=== Hyperparameter Tuning Results ===")
+    for i, res in enumerate(sorted(results, key=lambda x: x['val_accuracy'], reverse=True)):
+        print(f"{i+1}. Accuracy: {res['val_accuracy']:.4f} - LR: {res['learning_rate']}, " 
+              f"Layers: {res['hidden_layers']}, Dropout: {res['dropout_rate']}, "
+              f"Batch Size: {res['batch_size']}")
+    
+    print(f"\nBest Configuration: {best_config}")
+    return best_params, best_config
 
-# Update the training step to include dropout
-@jit
-def train_step(params, X, y, key, learning_rate=0.001, dropout_rate=0.2):
-    """Perform one step of gradient descent with dropout."""
-    dropout_key, subkey = random.split(key)
-    grads = grad_loss_fn(params, X, y)
-    new_params = [(w - learning_rate * dw, b - learning_rate * db) 
-                  for (w, b), (dw, db) in zip(params, grads)]
-    return new_params, dropout_key
+# Modified evaluation function for hyperparameter tuning
+def evaluate(params, X, y, dropout_rate=0.0, train=False) -> float:
+    """Evaluate model accuracy with optional dropout"""
+    key = random.PRNGKey(99) if train else None
+    logits = mlp_forward(params, X, dropout_rate=dropout_rate, train=train, key=key)
+    preds = jax.nn.sigmoid(logits)
+    binary_preds = (preds > 0.5).astype(jnp.float32)
+    accuracy = jnp.mean(binary_preds == y)
+    return float(accuracy)
 
-# Training data (replace with your own)
-X_train = bigdata_train_embedded_jax[:, 1:]
-print(X_train[:10,:])
-print(X_train.shape)
-y_train = bigdata_train_embedded_jax[:, 0]
-print(y_train[:10])
-print(y_train.shape)
+# Run hyperparameter tuning
+print("\n=== Starting Hyperparameter Tuning ===")
+best_params, best_config = tune_hyperparameters()
 
-# Training loop with dropout
+# Train final model with best hyperparameters
+print("\n=== Training Final Model with Best Hyperparameters ===")
 key = random.PRNGKey(0)
-layer_sizes = [X_train.shape[1], 128, 64, 32, 1]  # Enhanced layer sizes
-params = init_params(layer_sizes, key)
-dropout_key = random.PRNGKey(1)
+layer_sizes = [input_dim] + best_config['hidden_layers'] + [1]
+params = init_mlp_params(layer_sizes, key)
 
-num_epochs = 3000
+# Initialize optimizer with best learning rate
+optimizer = optax.adam(learning_rate=best_config['learning_rate'])
+opt_state = optimizer.init(params)
+
+# Training with mini-batches
+num_epochs = 100
+batch_size = best_config['batch_size']
+num_batches = max(1, len(X_train) // batch_size)
+
 for epoch in range(num_epochs):
-    params, dropout_key = train_step(params, X_train, y_train, dropout_key, learning_rate=0.005, dropout_rate=0.2)
-    if epoch % 100 == 0 or epoch == num_epochs - 1:
-        loss = binary_cross_entropy_loss(params, X_train, y_train)
-        print(f"Epoch {epoch}, Loss: {loss}")
+    # Shuffle data
+    perm = random.permutation(key, len(X_train))
+    key = random.fold_in(key, epoch)
+    
+    # Mini-batch updates
+    total_loss = 0.0
+    for i in range(num_batches):
+        batch_idx = perm[i * batch_size:(i + 1) * batch_size]
+        X_batch = X_train[batch_idx]
+        y_batch = y_train[batch_idx]
+        
+        params, opt_state, loss = train_step(
+            params, X_batch, y_batch, opt_state, 
+            dropout_rate=best_config['dropout_rate'], train=True
+        )
+        total_loss += loss
+    
+    avg_loss = total_loss / num_batches
+    if epoch % 10 == 0 or epoch == num_epochs - 1:
+        train_acc = evaluate(params, X_train, y_train, dropout_rate=0.0, train=False)
+        val_acc = evaluate(params, X_valid, y_valid, dropout_rate=0.0, train=False)
+        print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
 
-# Process validation data
-valid_texts = bigdata_valid_df['text'].tolist()
-X_valid_embeddings = get_sbert_embeddings(valid_texts)
-X_valid = jnp.array(X_valid_embeddings, dtype=jnp.float32)
-y_valid = jnp.array(bigdata_valid_df['gold'].values, dtype=jnp.float32)
-
-# Evaluate on validation set with sigmoid activation
-valid_logits = mlp(params, X_valid)
-valid_preds = jax.nn.sigmoid(valid_logits)
-valid_loss = binary_cross_entropy_loss(params, X_valid, y_valid)
-print(f"Validation Loss: {valid_loss}")
-
-# Calculate accuracy
-valid_preds_binary = (valid_preds > 0.5).astype(jnp.float32)
-accuracy = jnp.mean(valid_preds_binary == y_valid)
-print(f"Validation Accuracy: {accuracy}")
+# Final evaluation
+final_accuracy = evaluate(params, X_valid, y_valid, dropout_rate=0.0, train=False)
+print(f"\nFinal Validation Accuracy: {final_accuracy:.10f}")
