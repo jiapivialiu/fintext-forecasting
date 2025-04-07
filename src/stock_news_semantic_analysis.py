@@ -357,3 +357,219 @@ final_predictions = bagging_predict(X_valid)
 # Evaluate final predictions (accuracy)
 accuracy = np.mean(final_predictions == y_valid)
 print(f"Bagging Accuracy: {accuracy:.4f}")
+
+#* Fine-tuned FINBERT *#
+from transformers import BertTokenizer, BertForSequenceClassification
+from peft import LoraConfig, get_peft_model, TaskType
+import torch
+from torch import nn
+
+# Load the pre-trained 'ProsusAI/finbert' model and tokenizer
+model_name = 'ProsusAI/finbert'
+tokenizer = BertTokenizer.from_pretrained(model_name)
+
+finbert = BertForSequenceClassification.from_pretrained(model_name)  # Binary classification
+finbert.config.num_labels = 2
+finbert.num_labels = 2
+
+# Add dropout to the classifier for better regularization
+# First apply the base model modifications
+dropout_prob = 0.5
+finbert.classifier = nn.Sequential(
+    nn.Dropout(dropout_prob),
+    nn.Linear(finbert.config.hidden_size, finbert.config.num_labels)
+)
+original_finbert = finbert
+
+# Configure PEFT with LoRA specifically for binary classification
+# Modify target modules but don't include the classifier in modules_to_save
+peft_config = LoraConfig(
+    task_type=TaskType.SEQ_CLS,
+    r=8,
+    lora_alpha=32,
+    lora_dropout=0.5,
+    bias="none",
+    target_modules=["query", "key", "value", "output.dense"],
+    # Don't include classifier here to avoid the AttributeError
+    # We'll manually freeze/unfreeze layers instead
+)
+
+# Wrap the model with LoRA
+finbert = get_peft_model(finbert, peft_config)
+
+# Manually ensure the classifier parameters are trainable
+# This replaces the need for modules_to_save
+for param in finbert.classifier.parameters():
+    param.requires_grad = True
+
+finbert.print_trainable_parameters()
+
+# set up data loader
+from datasets import Dataset
+
+acl_train_ds = Dataset.from_pandas(acl_train_df)
+acl_valid_ds = Dataset.from_pandas(acl_valid_df)
+
+def tokenize_function(example):
+    return tokenizer(
+        example["text"], 
+        padding=True,            # Padding handled dynamically by the DataCollator
+        truncation=True,
+        max_length=128
+    )
+
+acl_train_token = acl_train_ds.map(tokenize_function, batched=True)
+acl_valid_token = acl_valid_ds.map(tokenize_function, batched=True)
+
+acl_train_token = acl_train_token.rename_column("gold", "label")
+acl_valid_token = acl_valid_token.rename_column("gold", "label")
+
+acl_train_token.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
+acl_valid_token.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
+
+from torch.utils.data import DataLoader
+from transformers import DataCollatorWithPadding
+
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer, return_tensors="pt")
+
+train_dataloader = DataLoader(acl_train_token, batch_size=16, shuffle=True, collate_fn=data_collator)
+valid_dataloader = DataLoader(acl_valid_token, batch_size=16, shuffle=False, collate_fn=data_collator)
+
+# train with torch
+import torch
+from torch import nn
+from transformers import AdamW
+from tqdm import tqdm
+from transformers import get_scheduler
+
+# setup device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+finbert.to(device)
+print(device)
+
+# set up optimizer
+optimizer = AdamW(finbert.parameters(), lr=1e-5, weight_decay=0.1)  # Reduced learning rate and increased weight decay
+
+# set up loss function
+# Add class weights to handle class imbalance if needed
+class_weights = torch.tensor([1.0, 1.0], device=device)  # Adjust based on class distribution
+loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+
+# Add early stopping mechanism
+best_val_accuracy = 0
+patience = 2
+early_stop_counter = 0
+best_model_state = None
+
+# Add learning rate scheduler for better convergence
+num_epochs = 5  # Increase epochs since we have early stopping
+lr_scheduler = get_scheduler(
+    "cosine",  # Use cosine schedule for better convergence
+    optimizer=optimizer, 
+    num_warmup_steps=int(0.1 * len(train_dataloader) * num_epochs),  # 10% warmup
+    num_training_steps=len(train_dataloader) * num_epochs
+)
+
+# torch training loop with regularization techniques
+for epoch in range(num_epochs):
+    finbert.train()
+    total_loss = 0
+
+    for batch in tqdm(train_dataloader, desc=f"Epoch {epoch + 1}"):
+        batch = {k: v.to(device) for k, v in batch.items()}
+
+        # Enable dropout during training (it's enabled by default in train mode)
+        outputs = finbert(**batch)
+        loss = outputs.loss
+        
+        # Add L2 regularization if needed
+        # for param in finbert.parameters():
+        #    loss += 0.01 * torch.sum(param ** 2)
+            
+        total_loss += loss.item()
+
+        loss.backward()
+        
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(finbert.parameters(), max_norm=1.0)
+        
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad()
+
+    avg_train_loss = total_loss / len(train_dataloader)
+    print(f"Epoch {epoch + 1} - Avg training loss: {avg_train_loss:.4f}")
+
+    # Validation
+    finbert.eval()
+    correct, total = 0, 0
+    val_loss = 0
+    
+    with torch.no_grad():
+        for batch in valid_dataloader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = finbert(**batch)
+            val_loss += outputs.loss.item()
+            predictions = torch.argmax(outputs.logits, dim=-1)
+            correct += (predictions == batch["labels"]).sum().item()
+            total += batch["labels"].size(0)
+
+    val_accuracy = correct / total
+    avg_val_loss = val_loss / len(valid_dataloader)
+    print(f"Validation Loss: {avg_val_loss:.4f}, Accuracy: {val_accuracy:.4f}")
+    
+    # Early stopping check
+    if val_accuracy > best_val_accuracy:
+        best_val_accuracy = val_accuracy
+        early_stop_counter = 0
+        # Save best model state
+        best_model_state = {k: v.cpu().clone() for k, v in finbert.state_dict().items()}
+    else:
+        early_stop_counter += 1
+        
+    if early_stop_counter >= patience:
+        print(f"Early stopping triggered after {epoch + 1} epochs")
+        break
+
+# Load the best model state before saving
+if best_model_state is not None:
+    finbert.load_state_dict(best_model_state)
+    print(f"Loaded best model with validation accuracy: {best_val_accuracy:.10f}")
+
+# Evaluate the original FinBERT (before LoRA fine-tuning)
+print("\n=== Evaluating Original FinBERT Model ===")
+original_finbert.to(device)
+
+# Evaluation function for models
+def evaluate_model(model, dataloader, device):
+    model.eval()
+    correct, total = 0, 0
+    val_loss = 0
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            val_loss += outputs.loss.item()
+            predictions = torch.argmax(outputs.logits, dim=-1)
+            correct += (predictions == batch["labels"]).sum().item()
+            total += batch["labels"].size(0)
+
+    accuracy = correct / total
+    avg_loss = val_loss / len(dataloader)
+    return accuracy, avg_loss
+
+# Evaluate original FinBERT
+original_accuracy, original_loss = evaluate_model(original_finbert, valid_dataloader, device)
+print(f"Original FinBERT - Validation Loss: {original_loss:.4f}, Accuracy: {original_accuracy:.4f}")
+
+# Compare with fine-tuned model
+print("\n=== Model Comparison ===")
+print(f"Original FinBERT Accuracy: {original_accuracy:.4f}")
+print(f"Fine-tuned FinBERT Accuracy: {best_val_accuracy:.4f}")
+print(f"Improvement: {best_val_accuracy - original_accuracy:.4f}")
+
+# save the fine-tuned model
+finbert.save_pretrained("finbert-lora-semantic")
+tokenizer.save_pretrained("finbert-lora-semantic")
+
