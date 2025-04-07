@@ -221,9 +221,27 @@ def train_step(params, X_batch, y_batch, opt_state, dropout_rate=0.2, train=True
     new_params = optax.apply_updates(params, updates)
     return new_params, new_opt_state, loss
 
+# Modified evaluation function for hyperparameter tuning
+def evaluate(params, X, y, dropout_rate=0.0, train=False) -> tuple:
+    """Evaluate model accuracy and MCC with optional dropout"""
+    key = random.PRNGKey(99) if train else None
+    logits = mlp_forward(params, X, dropout_rate=dropout_rate, train=train, key=key)
+    preds = jax.nn.sigmoid(logits)
+    binary_preds = (preds > 0.5).astype(jnp.float32)
+    accuracy = jnp.mean(binary_preds == y)
+    
+    # Calculate MCC
+    # Need to convert to numpy arrays for matthews_corrcoef
+    y_np = np.array(y.flatten())
+    preds_np = np.array(binary_preds.flatten())
+    mcc = matthews_corrcoef(y_np, preds_np)
+    
+    return float(accuracy), float(mcc)
+
 # Hyperparameter tuning
 def tune_hyperparameters():
     best_accuracy = 0.0
+    best_mcc = -1.0  # MCC ranges from -1 to 1, so start with worst possible
     best_params = None
     best_config = {}
     
@@ -281,8 +299,8 @@ def tune_hyperparameters():
                             print(f"Epoch {epoch+1} | Avg Loss: {avg_loss:.4f}")
                     
                     # Evaluate on validation set
-                    val_accuracy = evaluate(params, X_valid, y_valid, dropout_rate=0.0, train=False)
-                    print(f"Validation Accuracy: {val_accuracy:.4f}")
+                    val_accuracy, val_mcc = evaluate(params, X_valid, y_valid, dropout_rate=0.0, train=False)
+                    print(f"Validation Accuracy: {val_accuracy:.4f}, MCC: {val_mcc:.4f}")
                     
                     # Record result
                     config = {
@@ -290,34 +308,26 @@ def tune_hyperparameters():
                         'hidden_layers': hidden_layers,
                         'dropout_rate': dropout_rate,
                         'batch_size': batch_size,
-                        'val_accuracy': val_accuracy
+                        'val_accuracy': val_accuracy,
+                        'val_mcc': val_mcc
                     }
                     results.append(config)
                     
-                    # Update best model
-                    if val_accuracy > best_accuracy:
+                    # Update best model - now using MCC as primary metric
+                    if val_mcc > best_mcc:
+                        best_mcc = val_mcc
                         best_accuracy = val_accuracy
                         best_params = params
                         best_config = config
     
     print("\n=== Hyperparameter Tuning Results ===")
-    for i, res in enumerate(sorted(results, key=lambda x: x['val_accuracy'], reverse=True)):
-        print(f"{i+1}. Accuracy: {res['val_accuracy']:.4f} - LR: {res['learning_rate']}, " 
+    for i, res in enumerate(sorted(results, key=lambda x: x['val_mcc'], reverse=True)):
+        print(f"{i+1}. MCC: {res['val_mcc']:.4f}, Acc: {res['val_accuracy']:.4f} - LR: {res['learning_rate']}, " 
               f"Layers: {res['hidden_layers']}, Dropout: {res['dropout_rate']}, "
               f"Batch Size: {res['batch_size']}")
     
     print(f"\nBest Configuration: {best_config}")
     return best_params, best_config
-
-# Modified evaluation function for hyperparameter tuning
-def evaluate(params, X, y, dropout_rate=0.0, train=False) -> float:
-    """Evaluate model accuracy with optional dropout"""
-    key = random.PRNGKey(99) if train else None
-    logits = mlp_forward(params, X, dropout_rate=dropout_rate, train=train, key=key)
-    preds = jax.nn.sigmoid(logits)
-    binary_preds = (preds > 0.5).astype(jnp.float32)
-    accuracy = jnp.mean(binary_preds == y)
-    return float(accuracy)
 
 # Run hyperparameter tuning
 print("\n=== Starting Hyperparameter Tuning ===")
@@ -338,6 +348,15 @@ num_epochs = 100
 batch_size = best_config['batch_size']
 num_batches = max(1, len(X_train) // batch_size)
 
+# Add early stopping parameters
+best_val_mcc = -1.0
+patience = 5
+early_stop_counter = 0
+best_params_state = None
+
+# Set seed for reproducibility in training
+seed = 258
+key = random.PRNGKey(seed)
 for epoch in range(num_epochs):
     # Shuffle data
     perm = random.permutation(key, len(X_train))
@@ -357,14 +376,37 @@ for epoch in range(num_epochs):
         total_loss += loss
     
     avg_loss = total_loss / num_batches
+    
+    # Evaluate model on training and validation sets
+    train_acc, train_mcc = evaluate(params, X_train, y_train, dropout_rate=0.0, train=False)
+    val_acc, val_mcc = evaluate(params, X_valid, y_valid, dropout_rate=0.0, train=False)
+    
+    # Print progress every 10 epochs or on the last epoch
     if epoch % 10 == 0 or epoch == num_epochs - 1:
-        train_acc = evaluate(params, X_train, y_train, dropout_rate=0.0, train=False)
-        val_acc = evaluate(params, X_valid, y_valid, dropout_rate=0.0, train=False)
-        print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
+        print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Train Acc: {train_acc:.4f} | Train Mcc: {train_mcc:.4f} | Val Acc: {val_acc:.4f} | Val MCC: {val_mcc:.4f}")
+    
+    # Early stopping check based on MCC
+    if val_mcc > best_val_mcc:
+        best_val_mcc = val_mcc
+        early_stop_counter = 0
+        # Save best parameters (deepcopy equivalent for JAX)
+        best_params_state = [(W.copy(), b.copy()) for W, b in params]
+        print(f"Epoch {epoch+1} | New best MCC: {best_val_mcc:.4f}")
+    else:
+        early_stop_counter += 1
+        if early_stop_counter >= patience:
+            print(f"Early stopping triggered after {epoch+1} epochs")
+            break
+
+# Restore best parameters
+if best_params_state is not None:
+    params = best_params_state
+    print(f"Restored best model with validation MCC: {best_val_mcc:.4f}")
 
 # Final evaluation
-final_accuracy = evaluate(params, X_valid, y_valid, dropout_rate=0.0, train=False)
+final_accuracy, final_mcc = evaluate(params, X_valid, y_valid, dropout_rate=0.0, train=False)
 print(f"\nFinal Validation Accuracy: {final_accuracy:.10f}")
+print(f"Final Validation MCC: {final_mcc:.10f}")
 
 #* 3. Bagging *#
 
@@ -427,11 +469,13 @@ def bagging_predict(X):
 # Apply bagging prediction
 final_predictions = bagging_predict(X_valid)
 
-# Evaluate final predictions (accuracy)
+# Evaluate final predictions
 accuracy = np.mean(final_predictions == y_valid)
+bagging_mcc = matthews_corrcoef(y_valid, final_predictions)
 print(f"Bagging Accuracy: {accuracy:.4f}")
+print(f"Bagging MCC: {bagging_mcc:.4f}")
 
-#* Fine-tuned FINBERT *#
+#* 4. Fine-tuned FINBERT *#
 from transformers import BertTokenizer, BertForSequenceClassification
 from peft import LoraConfig, get_peft_model, TaskType
 import torch
@@ -452,7 +496,6 @@ finbert.classifier = nn.Sequential(
     nn.Dropout(dropout_prob),
     nn.Linear(finbert.config.hidden_size, finbert.config.num_labels)
 )
-original_finbert = finbert
 
 # Configure PEFT with LoRA specifically for binary classification
 # Modify target modules but don't include the classifier in modules_to_save
@@ -528,7 +571,8 @@ optimizer = AdamW(finbert.parameters(), lr=1e-5, weight_decay=0.1)  # Reduced le
 class_weights = torch.tensor([1.0, 1.0], device=device)  # Adjust based on class distribution
 loss_fn = nn.CrossEntropyLoss(weight=class_weights)
 
-# Add early stopping mechanism
+# Add early stopping mechanism (now based on MCC instead of accuracy)
+best_val_mcc = -1.0  # MCC ranges from -1 to 1
 best_val_accuracy = 0
 patience = 2
 early_stop_counter = 0
@@ -577,6 +621,8 @@ for epoch in range(num_epochs):
     finbert.eval()
     correct, total = 0, 0
     val_loss = 0
+    all_preds = []
+    all_labels = []
     
     with torch.no_grad():
         for batch in valid_dataloader:
@@ -586,13 +632,19 @@ for epoch in range(num_epochs):
             predictions = torch.argmax(outputs.logits, dim=-1)
             correct += (predictions == batch["labels"]).sum().item()
             total += batch["labels"].size(0)
+            
+            # Collect predictions and labels for MCC calculation
+            all_preds.extend(predictions.cpu().numpy())
+            all_labels.extend(batch["labels"].cpu().numpy())
 
     val_accuracy = correct / total
+    val_mcc = matthews_corrcoef(all_labels, all_preds)
     avg_val_loss = val_loss / len(valid_dataloader)
-    print(f"Validation Loss: {avg_val_loss:.4f}, Accuracy: {val_accuracy:.4f}")
+    print(f"Validation Loss: {avg_val_loss:.4f}, Accuracy: {val_accuracy:.4f}, MCC: {val_mcc:.4f}")
     
-    # Early stopping check
-    if val_accuracy > best_val_accuracy:
+    # Early stopping check - now based on MCC
+    if val_mcc > best_val_mcc:
+        best_val_mcc = val_mcc
         best_val_accuracy = val_accuracy
         early_stop_counter = 0
         # Save best model state
@@ -607,7 +659,7 @@ for epoch in range(num_epochs):
 # Load the best model state before saving
 if best_model_state is not None:
     finbert.load_state_dict(best_model_state)
-    print(f"Loaded best model with validation accuracy: {best_val_accuracy:.10f}")
+    print(f"Loaded best model with validation MCC: {best_val_mcc:.10f}, Accuracy: {best_val_accuracy:.10f}")
 
 # Evaluate the original FinBERT (before LoRA fine-tuning)
 print("\n=== Evaluating Original FinBERT Model ===")
@@ -641,20 +693,25 @@ def evaluate_model(model, dataloader, device):
     mcc = matthews_corrcoef(all_labels, all_preds)
     return accuracy, avg_loss, mcc
 
-# Evaluate original FinBERT
-original_accuracy, original_loss, original_mcc = evaluate_model(original_finbert, valid_dataloader, device)
-print(f"Original FinBERT - Validation Loss: {original_loss:.4f}, Accuracy: {original_accuracy:.4f}, MCC: {original_mcc:.4f}")
-
-# Compare with fine-tuned model
-print("\n=== Model Comparison ===")
-print(f"Original FinBERT Accuracy: {original_accuracy:.4f}, MCC: {original_mcc:.4f}")
-print(f"Fine-tuned FinBERT Accuracy: {best_val_accuracy:.4f}, MCC: {best_val_accuracy - original_accuracy:.4f}")
-print(f"Improvement: Accuracy: {best_val_accuracy - original_accuracy:.4f}")
-
-# We need to evaluate the fine-tuned model again to get its MCC
-finbert_accuracy, finbert_loss, finbert_mcc = evaluate_model(finbert, valid_dataloader, device)
-print(f"MCC Comparison - Original: {original_mcc:.4f}, Fine-tuned: {finbert_mcc:.4f}, Improvement: {finbert_mcc - original_mcc:.4f}")
-
 # save the fine-tuned model
 finbert.save_pretrained("finbert-lora-semantic")
 tokenizer.save_pretrained("finbert-lora-semantic")
+
+# Evaluate original FinBERT# Evaluate the original FinBERT (before LoRA fine-tuning)
+original_finbert = BertForSequenceClassification.from_pretrained(model_name)  # Binary classification
+original_finbert.config.num_labels = 2
+original_finbert.num_labels = 2
+dropout_prob = 0.5
+original_finbert.classifier = nn.Sequential(
+    nn.Dropout(dropout_prob),
+    nn.Linear(original_finbert.config.hidden_size, original_finbert.config.num_labels)
+)
+original_finbert.to(device)
+original_accuracy, original_loss, original_mcc = evaluate_model(original_finbert, valid_dataloader, device)
+
+# Evaluate the fine-tuned FinBERT
+finbert_accuracy, finbert_loss, finbert_mcc = evaluate_model(finbert, valid_dataloader, device)
+
+print("\n=== Model Comparison ===")
+print(f"Original FinBERT - Validation Loss: {original_loss:.4f}, Accuracy: {original_accuracy:.4f}, MCC: {original_mcc:.4f}")
+print(f"Fine-tuned FinBERT - Accuracy: {finbert_accuracy:.4f}, MCC: {finbert_mcc:.4f}")
