@@ -292,3 +292,68 @@ for epoch in range(num_epochs):
 # Final evaluation
 final_accuracy = evaluate(params, X_valid, y_valid, dropout_rate=0.0, train=False)
 print(f"\nFinal Validation Accuracy: {final_accuracy:.10f}")
+
+#* 3. Bagging *#
+
+# manually bagging
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier, BaggingClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.utils import resample
+import numpy as np
+
+# List of classifiers to use
+classifiers = [
+    LogisticRegression(),
+    SVC(kernel='linear'),
+    RandomForestClassifier(n_estimators=100),
+    KNeighborsClassifier(n_neighbors=5)
+]
+
+# Number of bootstrap samples
+n_bootstrap = 10
+
+# Create an empty list to store models
+trained_classifiers = []
+
+# Generate bootstrap samples and train each model
+for clf in classifiers:
+    clf_bootstrap_models = []
+    for _ in range(n_bootstrap):
+        # Generate bootstrap sample (with replacement)
+        X_resampled, y_resampled = resample(X_train, y_train, n_samples=X_train.shape[0], random_state=42)
+        clf_clone = clf.__class__()  # Create a fresh clone of the classifier
+        clf_clone.fit(X_resampled, y_resampled)
+        clf_bootstrap_models.append(clf_clone)
+    
+    # Append the trained bootstrap models to the list of classifiers
+    trained_classifiers.append(clf_bootstrap_models)
+
+# Function to aggregate predictions using majority voting
+
+def bagging_predict(X):
+    predictions = []
+    
+    for clf_bootstrap_models in trained_classifiers:
+        clf_preds = np.zeros((X.shape[0], len(clf_bootstrap_models)))
+        
+        for idx, model in enumerate(clf_bootstrap_models):
+            clf_preds[:, idx] = model.predict(X)
+        
+        # Average predictions for each classifier group
+        avg_pred = np.mean(clf_preds, axis=1)
+        # Convert to binary predictions using threshold
+        binary_pred = (avg_pred >= 0.5).astype(int)
+        predictions.append(binary_pred)
+    
+    # Final ensemble prediction
+    final_pred = np.mean(predictions, axis=0)
+    return (final_pred >= 0.5).astype(int)
+
+# Apply bagging prediction
+final_predictions = bagging_predict(X_valid)
+
+# Evaluate final predictions (accuracy)
+accuracy = np.mean(final_predictions == y_valid)
+print(f"Bagging Accuracy: {accuracy:.4f}")
