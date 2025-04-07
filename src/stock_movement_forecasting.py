@@ -17,7 +17,6 @@ acl_test_df = acl_test.to_pandas()[['gold', 'text']]
 # Initialize the pre-trained model for text embedding (using a compact and efficient model)
 from sentence_transformers import SentenceTransformer
 import numpy as np
-
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
 # Text embedding with batch processing
@@ -58,9 +57,14 @@ acl_test_embedded_jax = jnp.array(acl_test_embedded, dtype=jnp.float32)
 
 # * Modelling *#
 
-#* 1. Logistic Regression *#
-from sklearn.metrics import classification_report
-from sklearn.linear_model import LogisticRegression
+#* 1. XGBoost (Baseline Model) *#
+from sklearn.metrics import classification_report, matthews_corrcoef
+import xgboost as xgb
+from sklearn.model_selection import RandomizedSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from imblearn.over_sampling import SMOTE
+import numpy as np
 
 # Prepare data for modelling
 y_train = acl_train_embedded[:, 0].reshape(-1, 1)
@@ -68,19 +72,88 @@ X_train = acl_train_embedded[:, 1:]
 y_valid = acl_valid_embedded[:, 0].reshape(-1, 1)
 X_valid = acl_valid_embedded[:, 1:]
 
-# Train logistic regression model
-maxiter = 1000
-lr_model = LogisticRegression(max_iter=maxiter, random_state=42)
-lr_model.fit(X_train, y_train)
+# Check class balance
+unique, counts = np.unique(y_train, return_counts=True)
+class_distribution = dict(zip(unique, counts))
+print("\nClass distribution in training data:", class_distribution)
+
+# Apply SMOTE for class balancing if imbalanced
+if len(unique) > 1 and min(counts) / max(counts) < 0.8:
+    print("Applying SMOTE to balance classes...")
+    smote = SMOTE(random_state=42)
+    X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train.ravel())
+    # Convert back to original shape
+    X_train = X_train_resampled
+    y_train = y_train_resampled.reshape(-1, 1)
+    print("After SMOTE - samples:", X_train.shape[0])
+
+# Create a pipeline with standardization and XGBoost
+pipe = Pipeline([
+    ('scaler', StandardScaler()),
+    ('clf', xgb.XGBClassifier(
+        objective='binary:logistic',
+        random_state=42,
+        use_label_encoder=False,
+        eval_metric='logloss'
+    ))
+])
+
+# Define parameter grid for tuning
+param_grid = {
+    'clf__n_estimators': [50, 100, 200, 300],
+    'clf__max_depth': [3, 4, 5, 6, 8],
+    'clf__learning_rate': [0.01, 0.05, 0.1, 0.2],
+    'clf__subsample': [0.6, 0.8, 1.0],
+    'clf__colsample_bytree': [0.6, 0.8, 1.0],
+    'clf__min_child_weight': [1, 3, 5],
+    'clf__gamma': [0, 0.1, 0.2]
+}
+
+# Use RandomizedSearchCV for efficient hyperparameter tuning
+print("\nTuning XGBoost hyperparameters...")
+random_search = RandomizedSearchCV(
+    pipe,
+    param_distributions=param_grid,
+    n_iter=20,  # Number of parameter settings to try
+    cv=5,
+    scoring='matthews_corrcoef',
+    n_jobs=-1,
+    verbose=1,
+    random_state=42
+)
+
+random_search.fit(X_train, y_train.ravel())
+
+# Get best parameters and model
+print(f"\nBest parameters: {random_search.best_params_}")
+print(f"Best cross-validation MCC: {random_search.best_score_:.4f}")
+
+# Train optimized model with best parameters
+best_xgb_model = random_search.best_estimator_
 
 # Evaluate on validation set
-y_pred = lr_model.predict(X_valid)
+y_pred = best_xgb_model.predict(X_valid)
+
+# Calculate MCC for XGBoost
+xgb_mcc = matthews_corrcoef(y_valid, y_pred)
 
 # Print performance metrics
-print("\nLogistic Regression Results:")
-print(f"Validation Accuracy: {lr_model.score(X_valid, y_valid):.4f}")
+print("\nOptimized XGBoost Results:")
+print(f"Validation Accuracy: {best_xgb_model.score(X_valid, y_valid):.4f}")
+print(f"Matthews Correlation Coefficient: {xgb_mcc:.4f}")
 print("\nDetailed Classification Report:")
 print(classification_report(y_valid, y_pred))
+
+# Feature importance analysis
+if hasattr(best_xgb_model[-1], 'feature_importances_'):
+    importances = best_xgb_model[-1].feature_importances_
+    print("\nTop 10 Most Important Features:")
+    indices = np.argsort(importances)[::-1][:10]
+    for i, idx in enumerate(indices):
+        print(f"{i+1}. Feature {idx}: {importances[idx]:.4f}")
+
+# Store the model for comparison with other methods
+baseline_model = best_xgb_model
 
 #* 2. MLP with JAX *#
 import jax
@@ -541,10 +614,14 @@ print("\n=== Evaluating Original FinBERT Model ===")
 original_finbert.to(device)
 
 # Evaluation function for models
+from sklearn.metrics import matthews_corrcoef
+
 def evaluate_model(model, dataloader, device):
     model.eval()
     correct, total = 0, 0
     val_loss = 0
+    all_preds = []
+    all_labels = []
     
     with torch.no_grad():
         for batch in dataloader:
@@ -554,22 +631,30 @@ def evaluate_model(model, dataloader, device):
             predictions = torch.argmax(outputs.logits, dim=-1)
             correct += (predictions == batch["labels"]).sum().item()
             total += batch["labels"].size(0)
+            
+            # Collect predictions and labels for MCC calculation
+            all_preds.extend(predictions.cpu().numpy())
+            all_labels.extend(batch["labels"].cpu().numpy())
 
     accuracy = correct / total
     avg_loss = val_loss / len(dataloader)
-    return accuracy, avg_loss
+    mcc = matthews_corrcoef(all_labels, all_preds)
+    return accuracy, avg_loss, mcc
 
 # Evaluate original FinBERT
-original_accuracy, original_loss = evaluate_model(original_finbert, valid_dataloader, device)
-print(f"Original FinBERT - Validation Loss: {original_loss:.4f}, Accuracy: {original_accuracy:.4f}")
+original_accuracy, original_loss, original_mcc = evaluate_model(original_finbert, valid_dataloader, device)
+print(f"Original FinBERT - Validation Loss: {original_loss:.4f}, Accuracy: {original_accuracy:.4f}, MCC: {original_mcc:.4f}")
 
 # Compare with fine-tuned model
 print("\n=== Model Comparison ===")
-print(f"Original FinBERT Accuracy: {original_accuracy:.4f}")
-print(f"Fine-tuned FinBERT Accuracy: {best_val_accuracy:.4f}")
-print(f"Improvement: {best_val_accuracy - original_accuracy:.4f}")
+print(f"Original FinBERT Accuracy: {original_accuracy:.4f}, MCC: {original_mcc:.4f}")
+print(f"Fine-tuned FinBERT Accuracy: {best_val_accuracy:.4f}, MCC: {best_val_accuracy - original_accuracy:.4f}")
+print(f"Improvement: Accuracy: {best_val_accuracy - original_accuracy:.4f}")
+
+# We need to evaluate the fine-tuned model again to get its MCC
+finbert_accuracy, finbert_loss, finbert_mcc = evaluate_model(finbert, valid_dataloader, device)
+print(f"MCC Comparison - Original: {original_mcc:.4f}, Fine-tuned: {finbert_mcc:.4f}, Improvement: {finbert_mcc - original_mcc:.4f}")
 
 # save the fine-tuned model
 finbert.save_pretrained("finbert-lora-semantic")
 tokenizer.save_pretrained("finbert-lora-semantic")
-
